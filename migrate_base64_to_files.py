@@ -192,6 +192,10 @@ def main():
     id_start = args.id_start
     id_end = args.id_end
 
+    if batch_size is None or batch_size <= 0:
+        print("Error: BATCH_SIZE must be set to a positive integer via --batch-size or BATCH_SIZE env.")
+        sys.exit(1)
+
     if id_start is not None and id_end is not None and id_start > id_end:
         print("Error: --id-start cannot be greater than --id-end.")
         sys.exit(1)
@@ -206,7 +210,7 @@ def main():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    select_sql = f"SELECT {ID_COLUMN}, {COLUMN_NAME} FROM {TABLE_NAME}"
+    # Build WHERE clause for counting and fetching
     where_clauses = []
     params = []
     if id_start is not None:
@@ -215,24 +219,44 @@ def main():
     if id_end is not None:
         where_clauses.append(f"{ID_COLUMN} <= %s")
         params.append(id_end)
-    if where_clauses:
-        select_sql += " WHERE " + " AND ".join(where_clauses)
-    select_sql += f" ORDER BY {ID_COLUMN} ASC"
 
-    cursor.execute(select_sql, tuple(params))
+    where_clause = ""
+    if where_clauses:
+        where_clause = " WHERE " + " AND ".join(where_clauses)
+
+    # Count total rows in the range
+    count_sql = f"SELECT COUNT(*) as cnt FROM {TABLE_NAME}" + where_clause
+    cursor.execute(count_sql, tuple(params))
+    count_result = cursor.fetchone()
+    total_rows_in_range = count_result["cnt"] if count_result else 0
+
+    if total_rows_in_range == 0:
+        print("No rows found in the specified range.")
+        cursor.close()
+        conn.close()
+        return
+
+    print(f"Total rows in range: {total_rows_in_range}")
 
     total_rows = 0
     updated_rows = 0
     batch_number = 0
+    offset = 0
 
-    if batch_size is None or batch_size <= 0:
-        print("Error: BATCH_SIZE must be set to a positive integer via --batch-size or BATCH_SIZE env.")
-        sys.exit(1)
+    # Fetch and process in batches using LIMIT OFFSET
+    while offset < total_rows_in_range:
+        fetch_sql = (
+            f"SELECT {ID_COLUMN}, {COLUMN_NAME} FROM {TABLE_NAME}"
+            + where_clause
+            + f" ORDER BY {ID_COLUMN} ASC LIMIT %s OFFSET %s"
+        )
+        fetch_params = list(params) + [batch_size, offset]
+        cursor.execute(fetch_sql, tuple(fetch_params))
+        rows = cursor.fetchall()
 
-    while True:
-        rows = cursor.fetchmany(batch_size)
         if not rows:
             break
+
         batch_number += 1
         print(f"Processing batch {batch_number}, rows: {len(rows)}")
 
@@ -255,6 +279,8 @@ def main():
                     conn.commit()
                     updated_rows += 1
                     print(f"Updated row {row_id}: extracted {len(replacements)} file(s)")
+
+        offset += batch_size
 
     print(f"Finished. Total rows scanned: {total_rows}")
     if not dry_run:
