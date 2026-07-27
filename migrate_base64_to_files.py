@@ -3,6 +3,7 @@ import argparse
 import os
 import re
 import sys
+import time
 import base64
 import mimetypes
 
@@ -37,6 +38,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "text_editor_files")
 TABLE_NAME = os.environ.get("TABLE_NAME", "complaints")
 COLUMN_NAME = os.environ.get("COLUMN_NAME", "details")
 ID_COLUMN = os.environ.get("ID_COLUMN", "id")
+LOG_FILE = os.environ.get("LOG_FILE", "migration.log")
 
 # If you want URLs instead of relative paths, change this prefix.
 URL_PREFIX = os.environ.get("URL_PREFIX", "text_editor_files")
@@ -185,6 +187,21 @@ def get_connection():
     return mysql.connect(**config)
 
 
+def ensure_log_file():
+    log_dir = os.path.dirname(LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    open(LOG_FILE, "a", encoding="utf-8").close()
+
+
+def log(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    line = f"[{timestamp}] {message}\n"
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(message)
+
+
 def main():
     args = get_script_args()
     dry_run = args.dry_run
@@ -200,12 +217,13 @@ def main():
         print("Error: --id-start cannot be greater than --id-end.")
         sys.exit(1)
 
-    print("Starting base64 extraction from complaints.details...")
+    ensure_log_file()
+    log("Starting base64 extraction from complaints.details...")
     if dry_run:
-        print("Running in dry-run mode: no files will be written and database updates are skipped.")
-    print(f"Batch size: {batch_size}")
+        log("Running in dry-run mode: no files will be written and database updates are skipped.")
+    log(f"Batch size: {batch_size}")
     if id_start is not None or id_end is not None:
-        print(f"ID range: {id_start or '-infinity'} to {id_end or 'infinity'}")
+        log(f"ID range: {id_start or '-infinity'} to {id_end or 'infinity'}")
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -231,13 +249,14 @@ def main():
     total_rows_in_range = count_result["cnt"] if count_result else 0
 
     if total_rows_in_range == 0:
-        print("No rows found in the specified range.")
+        log("No rows found in the specified range.")
         cursor.close()
         conn.close()
         return
 
-    print(f"Total rows in range: {total_rows_in_range}")
+    log(f"Total rows in range: {total_rows_in_range}")
 
+    start_time = time.time()
     total_rows = 0
     updated_rows = 0
     batch_number = 0
@@ -258,7 +277,8 @@ def main():
             break
 
         batch_number += 1
-        print(f"Processing batch {batch_number}, rows: {len(rows)}")
+        batch_start = time.time()
+        log(f"Processing batch {batch_number}, rows: {len(rows)}")
 
         for row in rows:
             total_rows += 1
@@ -270,21 +290,30 @@ def main():
             new_details, replacements = process_row(row_id, details, dry_run=dry_run)
             if replacements:
                 if dry_run:
-                    print(
-                        f"Dry-run: row {row_id} would extract {len(replacements)} file(s)."
-                    )
+                    log(f"Dry-run: row {row_id} would extract {len(replacements)} file(s).")
                 else:
                     update_sql = f"UPDATE {TABLE_NAME} SET {COLUMN_NAME} = %s WHERE {ID_COLUMN} = %s"
                     cursor.execute(update_sql, (new_details, row_id))
                     conn.commit()
                     updated_rows += 1
-                    print(f"Updated row {row_id}: extracted {len(replacements)} file(s)")
+                    log(f"Updated row {row_id}: extracted {len(replacements)} file(s)")
+
+        batch_end = time.time()
+        batch_seconds = batch_end - batch_start
+        elapsed = batch_end - start_time
+        rows_processed = min(offset + len(rows), total_rows_in_range)
+        average_per_batch = elapsed / batch_number if batch_number else 0
+        remaining_batches = ((total_rows_in_range - rows_processed) + batch_size - 1) // batch_size
+        eta_seconds = remaining_batches * average_per_batch
+        eta_formatted = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+
+        log(f"Batch {batch_number} completed in {batch_seconds:.2f}s, elapsed {elapsed:.2f}s, ETA {eta_formatted}")
 
         offset += batch_size
 
-    print(f"Finished. Total rows scanned: {total_rows}")
+    log(f"Finished. Total rows scanned: {total_rows}")
     if not dry_run:
-        print(f"Rows updated: {updated_rows}")
+        log(f"Rows updated: {updated_rows}")
     cursor.close()
     conn.close()
 

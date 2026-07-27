@@ -102,6 +102,7 @@ python3 migrate_base64_to_files.py --batch-size 100 --id-start 1 --id-end 50000
 
 - The script processes rows in batches using `LIMIT` and `OFFSET` to avoid high memory usage.
 - Files are written as `complaints_<id>_<serial>.<ext>` in the `text_editor_files/` folder.
+- The script now prints per-batch elapsed time and an ETA estimate during migration.
 - If the DB connection should not use SSL, set `DB_SSL_DISABLED=true` in `.env`.
 
 ## Example workflow
