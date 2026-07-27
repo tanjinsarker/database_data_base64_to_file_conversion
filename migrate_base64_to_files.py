@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
 import sys
@@ -40,6 +41,56 @@ ID_COLUMN = os.environ.get("ID_COLUMN", "id")
 # If you want URLs instead of relative paths, change this prefix.
 URL_PREFIX = os.environ.get("URL_PREFIX", "text_editor_files")
 
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    value = str(value).strip().lower()
+    return value in ("1", "true", "yes", "y")
+
+
+def parse_env_int(name, default=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def get_script_args():
+    parser = argparse.ArgumentParser(
+        description="Migrate inline base64 data in details to files and update records."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not write files or update the database; just show what would happen.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=parse_env_int("BATCH_SIZE"),
+        help="Number of rows to fetch per batch. This is mandatory via env or CLI.",
+    )
+    parser.add_argument(
+        "--id-start",
+        type=int,
+        default=parse_env_int("ID_START"),
+        help="Optional start ID for migration range.",
+    )
+    parser.add_argument(
+        "--id-end",
+        type=int,
+        default=parse_env_int("ID_END"),
+        help="Optional end ID for migration range.",
+    )
+    return parser.parse_args()
+
 DATA_URI_PATTERN = re.compile(
     r"(?P<attr>src|href)\s*=\s*(?P<quote>[\'\"])(?P<uri>data:(?P<mime>[^;]+);base64,(?P<data>[^\"\']+))(?P=quote)",
     re.IGNORECASE,
@@ -67,13 +118,14 @@ def get_extension(mime_type):
     return "bin"
 
 
-def decode_and_write_file(row_id, index, mime_type, data_bytes):
+def decode_and_write_file(row_id, index, mime_type, data_bytes, dry_run=False):
     ext = get_extension(mime_type)
     filename = f"{TABLE_NAME}_{row_id}_{index}.{ext}"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     file_path = os.path.join(OUTPUT_DIR, filename)
-    with open(file_path, "wb") as f:
-        f.write(data_bytes)
+    if not dry_run:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(file_path, "wb") as f:
+            f.write(data_bytes)
 
     prefix = URL_PREFIX.strip()
     if prefix:
@@ -82,7 +134,7 @@ def decode_and_write_file(row_id, index, mime_type, data_bytes):
     return filename
 
 
-def process_row(row_id, details):
+def process_row(row_id, details, dry_run=False):
     matches = list(DATA_URI_PATTERN.finditer(details))
     if not matches:
         return details, []
@@ -134,34 +186,79 @@ def get_connection():
 
 
 def main():
+    args = get_script_args()
+    dry_run = args.dry_run
+    batch_size = args.batch_size
+    id_start = args.id_start
+    id_end = args.id_end
+
+    if id_start is not None and id_end is not None and id_start > id_end:
+        print("Error: --id-start cannot be greater than --id-end.")
+        sys.exit(1)
+
     print("Starting base64 extraction from complaints.details...")
+    if dry_run:
+        print("Running in dry-run mode: no files will be written and database updates are skipped.")
+    print(f"Batch size: {batch_size}")
+    if id_start is not None or id_end is not None:
+        print(f"ID range: {id_start or '-infinity'} to {id_end or 'infinity'}")
+
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
     select_sql = f"SELECT {ID_COLUMN}, {COLUMN_NAME} FROM {TABLE_NAME}"
-    cursor.execute(select_sql)
+    where_clauses = []
+    params = []
+    if id_start is not None:
+        where_clauses.append(f"{ID_COLUMN} >= %s")
+        params.append(id_start)
+    if id_end is not None:
+        where_clauses.append(f"{ID_COLUMN} <= %s")
+        params.append(id_end)
+    if where_clauses:
+        select_sql += " WHERE " + " AND ".join(where_clauses)
+    select_sql += f" ORDER BY {ID_COLUMN} ASC"
 
-    rows = cursor.fetchall()
-    if not rows:
-        print("No rows found.")
-        return
+    cursor.execute(select_sql, tuple(params))
 
+    total_rows = 0
     updated_rows = 0
-    for row in rows:
-        row_id = row[ID_COLUMN]
-        details = row[COLUMN_NAME]
-        if not details:
-            continue
+    batch_number = 0
 
-        new_details, replacements = process_row(row_id, details)
-        if replacements:
-            update_sql = f"UPDATE {TABLE_NAME} SET {COLUMN_NAME} = %s WHERE {ID_COLUMN} = %s"
-            cursor.execute(update_sql, (new_details, row_id))
-            conn.commit()
-            updated_rows += 1
-            print(f"Updated row {row_id}: extracted {len(replacements)} file(s)")
+    if batch_size is None or batch_size <= 0:
+        print("Error: BATCH_SIZE must be set to a positive integer via --batch-size or BATCH_SIZE env.")
+        sys.exit(1)
 
-    print(f"Finished. Rows updated: {updated_rows}")
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        batch_number += 1
+        print(f"Processing batch {batch_number}, rows: {len(rows)}")
+
+        for row in rows:
+            total_rows += 1
+            row_id = row[ID_COLUMN]
+            details = row[COLUMN_NAME]
+            if not details:
+                continue
+
+            new_details, replacements = process_row(row_id, details, dry_run=dry_run)
+            if replacements:
+                if dry_run:
+                    print(
+                        f"Dry-run: row {row_id} would extract {len(replacements)} file(s)."
+                    )
+                else:
+                    update_sql = f"UPDATE {TABLE_NAME} SET {COLUMN_NAME} = %s WHERE {ID_COLUMN} = %s"
+                    cursor.execute(update_sql, (new_details, row_id))
+                    conn.commit()
+                    updated_rows += 1
+                    print(f"Updated row {row_id}: extracted {len(replacements)} file(s)")
+
+    print(f"Finished. Total rows scanned: {total_rows}")
+    if not dry_run:
+        print(f"Rows updated: {updated_rows}")
     cursor.close()
     conn.close()
 
