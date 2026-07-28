@@ -301,13 +301,8 @@ def main():
         batch_end = time.time()
         batch_seconds = batch_end - batch_start
         elapsed = batch_end - start_time
-        rows_processed = min(offset + len(rows), total_rows_in_range)
-        average_per_batch = elapsed / batch_number if batch_number else 0
-        remaining_batches = ((total_rows_in_range - rows_processed) + batch_size - 1) // batch_size
-        eta_seconds = remaining_batches * average_per_batch
-        eta_formatted = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
 
-        log(f"Batch {batch_number} completed in {batch_seconds:.2f}s, elapsed {elapsed:.2f}s, ETA {eta_formatted}")
+        log(f"Batch {batch_number} completed in {batch_seconds:.2f}s, elapsed {elapsed:.2f}s")
 
         offset += batch_size
 
